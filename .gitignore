@@ -1,0 +1,33 @@
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+/.skills/
+
+# Dependencies and generated build output
+**/node_modules/
+**/dist/
+**/build/
+
+# Python bytecode and virtual environments
+**/__pycache__/
+*.py[cod]
+*.so
+**/.venv/
+**/venv/
+**/myvenv/
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Editor, operating system, and temporary files
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.swp
+*.swo

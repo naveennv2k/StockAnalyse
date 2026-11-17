@@ -1,0 +1,39 @@
+{
+  "name": "ai-bridge",
+  "displayName": "AI Bridge",
+  "description": "Lets a local app on this machine send prompts to your GitHub Copilot model through a token-protected loopback endpoint.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "private": true,
+  "engines": { "vscode": "^1.95.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      { "command": "aiBridge.showLog", "title": "AI Bridge: Show Log" },
+      { "command": "aiBridge.copyToken", "title": "AI Bridge: Copy Token" },
+      { "command": "aiBridge.regenerateToken", "title": "AI Bridge: Regenerate Token" },
+      { "command": "aiBridge.toggle", "title": "AI Bridge: Start/Stop" }
+    ],
+    "configuration": {
+      "title": "AI Bridge",
+      "properties": {
+        "aiBridge.port": {
+          "type": "number",
+          "default": 8765,
+          "description": "Loopback port the bridge listens on (127.0.0.1 only). Must match the port in the app."
+        },
+        "aiBridge.logConversations": {
+          "type": "boolean",
+          "default": true,
+          "description": "Write each prompt received from the app and the model's reply to the AI Bridge output channel."
+        },
+        "aiBridge.modelFamily": {
+          "type": "string",
+          "default": "",
+          "description": "Preferred Copilot model family (for example gpt-4o). Leave empty to use any available model."
+        }
+      }
+    }
+  }
+}
