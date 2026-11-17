@@ -5,6 +5,7 @@ import { NewsService } from '../services/newsService.js';
 import { GeminiService, PROVIDERS } from '../services/geminiService.js';
 import { AutoTrader } from '../services/autoTrader.js';
 import { FlattradeAuth } from '../services/flattradeAuth.js';
+import { FlattradeOrders } from '../services/flattradeOrders.js';
 import { SymbolSearch } from '../services/symbolSearch.js';
 import { listTradingSkills } from '../services/tradingSkills.js';
 
@@ -13,7 +14,8 @@ const wallet = new DemoWallet();
 const marketData = new MarketDataService();
 const newsService = new NewsService();
 const gemini = new GeminiService();
-const autoTrader = new AutoTrader({ wallet, marketData, newsService, gemini });
+const flattradeOrders = new FlattradeOrders();
+const autoTrader = new AutoTrader({ wallet, marketData, newsService, gemini, flattradeOrders });
 autoTrader.start();
 export const attachLiveFeed = (liveFeed) => autoTrader.setLiveFeed(liveFeed);
 const flattradeAuth = new FlattradeAuth(wallet.db);
@@ -45,6 +47,14 @@ router.get('/flattrade/status', async (req, res) => {
 router.get('/flattrade/account', async (req, res) => {
   try {
     res.json(await marketData.getFlattradeAccount());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/flattrade/orders', async (req, res) => {
+  try {
+    res.json({ orders: await flattradeOrders.getOrderBook(), source: 'flattrade' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -228,10 +238,14 @@ router.post('/wallet/reset', (req, res) => {
 // ═══════════════════════════════════════════════════════
 
 // POST /api/order — place an order
-router.post('/order', (req, res) => {
+router.post('/order', async (req, res) => {
   try {
     if (wallet.getWallet().trading_mode === 'live') {
-      return res.status(400).json({ success: false, error: 'Live order execution via Flattrade is not implemented yet. Switch to Demo mode to place orders.' });
+      if (req.body?.liveConfirmed !== true) {
+        return res.status(400).json({ success: false, error: 'Explicit live-order confirmation is required.' });
+      }
+      const result = await flattradeOrders.placeMarketOrder(req.body);
+      return res.json(result);
     }
     const result = wallet.placeOrder(req.body);
     if (result.success) {
@@ -250,7 +264,7 @@ router.get('/positions', async (req, res) => {
     if (wallet.getWallet().trading_mode === 'live') {
       const acc = await marketData.getFlattradeAccount();
       const positions = (acc.account?.positions || []).map((p) => ({ ...p, exchange: 'NSE' }));
-      return res.json({ positions, count: positions.length, source: 'flattrade', error: acc.error });
+      return res.json({ positions, count: positions.length, account: acc.account, connected: acc.connected, source: 'flattrade', error: acc.error });
     }
     await refreshPositionPrices().catch(() => {});
     const positions = wallet.getPositions();
@@ -357,6 +371,8 @@ router.post('/trading-mode', (req, res) => {
       return res.status(400).json({ error: 'Mode must be "demo" or "live"' });
     }
     const db = wallet.db;
+    autoTrader.setLiveArmed(false);
+    if (mode === 'live') db.prepare("UPDATE ai_settings SET auto_trade_enabled = 0 WHERE id = 1").run();
     db.prepare("UPDATE wallet SET trading_mode = ?, updated_at = datetime('now') WHERE id = 1").run(mode);
     res.json({ success: true, mode });
   } catch (err) {
@@ -413,12 +429,39 @@ router.get('/autotrade/status', (req, res) => {
   }
 });
 
-router.post('/autotrade/toggle', (req, res) => {
+router.post('/autotrade/calibration/backtest', async (_req, res) => {
+  try {
+    const settings = gemini.getSettings();
+    const walletInfo = wallet.getWallet();
+    const report = await marketData.backtestWatchlist(
+      wallet.getWatchlist(),
+      settings.candidate_min_confidence,
+      walletInfo.starting_balance,
+      settings.position_pct,
+    );
+    res.json(report);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/autotrade/toggle', async (req, res) => {
   try {
     const enabled = !!req.body?.enabled;
     if (enabled) {
       if (!gemini.isReady()) return res.status(400).json({ error: 'Enable AI (Gemini or ChatGPT) in Integrations first' });
-      if (wallet.getWallet().trading_mode !== 'demo') return res.status(400).json({ error: 'Auto-trading only runs in demo mode' });
+      if (wallet.getWallet().trading_mode === 'live') {
+        if (req.body?.liveConfirmed !== true) return res.status(400).json({ error: 'Explicit live AI trading confirmation is required.' });
+        const status = await marketData.getFlattradeStatus();
+        if (!status.connected) return res.status(400).json({ error: `Flattrade is not connected: ${status.error || 'authenticate on Integrations first'}` });
+        await flattradeOrders.verifyStaticIp();
+        await flattradeOrders.getAccount();
+        autoTrader.setLiveArmed(true);
+      } else {
+        autoTrader.setLiveArmed(false);
+      }
+    } else {
+      autoTrader.setLiveArmed(false);
     }
     gemini.updateSettings({ auto_trade_enabled: enabled });
     if (enabled) autoTrader.tick().catch((e) => console.error('AutoTrader tick failed:', e.message));
@@ -451,8 +494,12 @@ router.get('/agent/logs', (req, res) => {
 // GET /api/agent/lessons — correction agent lessons
 router.get('/agent/lessons', (req, res) => {
   try {
-    const lessons = wallet.getLessons();
-    res.json({ lessons });
+    const requestedLimit = Number.parseInt(req.query.limit, 10);
+    const requestedOffset = Number.parseInt(req.query.offset, 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 20;
+    const offset = Number.isFinite(requestedOffset) ? Math.max(requestedOffset, 0) : 0;
+    const lessons = wallet.getLessons(limit, offset);
+    res.json({ lessons, total: wallet.getLessonCount(), limit, offset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -129,7 +129,8 @@ function initSchema() {
       ai_min_confidence INTEGER NOT NULL DEFAULT 30,
       trading_instructions TEXT NOT NULL DEFAULT '',
       trading_skills TEXT NOT NULL DEFAULT '[]',
-      trading_skill_ids TEXT NOT NULL DEFAULT '["technical-analysis","risk-reward-ratio"]'
+      trading_skill_ids TEXT NOT NULL DEFAULT '["technical-analysis","risk-reward-ratio"]',
+      auto_trade_universe TEXT NOT NULL DEFAULT 'watchlist'
     );
     INSERT OR IGNORE INTO ai_settings (id) VALUES (1);
 
@@ -145,9 +146,86 @@ function initSchema() {
       news_label TEXT,
       executed INTEGER NOT NULL DEFAULT 0,
       trade_id TEXT,
+      pattern_name TEXT,
+      pattern_zone_anchor REAL,
+      pattern_zone_tolerance REAL,
+      pattern_target1 REAL,
+      pattern_target2 REAL,
+      pattern_stop REAL,
       outcome_pnl REAL,
       closed_at TEXT,
       created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_live_orders (
+      decision_id INTEGER PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      exchange TEXT NOT NULL,
+      side TEXT NOT NULL,
+      quantity INTEGER NOT NULL,
+      entry_order_id TEXT NOT NULL,
+      entry_status TEXT NOT NULL DEFAULT 'SUBMITTED',
+      entry_filled_quantity INTEGER NOT NULL DEFAULT 0,
+      entry_price REAL,
+      stop_loss REAL NOT NULL,
+      target REAL NOT NULL,
+      exit_order_id TEXT,
+      exit_status TEXT,
+      exit_filled_quantity INTEGER NOT NULL DEFAULT 0,
+      exit_price REAL,
+      closed_at TEXT,
+      updated_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY(decision_id) REFERENCES ai_decisions(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_side_evaluations (
+      decision_id INTEGER NOT NULL,
+      side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+      symbol TEXT NOT NULL,
+      raw_score INTEGER,
+      feature_snapshot TEXT NOT NULL DEFAULT '{}',
+      entry_price REAL NOT NULL,
+      quantity INTEGER NOT NULL,
+      stop_price REAL NOT NULL,
+      target_price REAL NOT NULL,
+      exchange TEXT NOT NULL DEFAULT 'NSE',
+      market_mode TEXT NOT NULL DEFAULT 'demo',
+      market_source TEXT NOT NULL DEFAULT 'unknown',
+      slippage_bps INTEGER NOT NULL DEFAULT 5,
+      outcome_status TEXT NOT NULL DEFAULT 'pending',
+      outcome_label INTEGER,
+      exit_reason TEXT,
+      exit_price REAL,
+      gross_pnl REAL,
+      estimated_fees REAL,
+      estimated_slippage REAL,
+      net_pnl REAL,
+      outcome_source TEXT,
+      sampled_at TEXT NOT NULL DEFAULT (datetime('now')),
+      evaluated_at TEXT,
+      PRIMARY KEY (decision_id, side),
+      FOREIGN KEY (decision_id) REFERENCES ai_decisions(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_daily_risk_locks (
+      session_date TEXT PRIMARY KEY,
+      trading_mode TEXT NOT NULL,
+      realized_pnl REAL NOT NULL DEFAULT 0,
+      unrealized_pnl REAL NOT NULL DEFAULT 0,
+      capital REAL NOT NULL,
+      locked_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_pattern_zone_strikes (
+      session_date TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      pattern_name TEXT NOT NULL,
+      zone_anchor REAL NOT NULL,
+      zone_tolerance REAL NOT NULL,
+      stop_count INTEGER NOT NULL DEFAULT 0,
+      locked_at TEXT,
+      last_decision_id INTEGER,
+      PRIMARY KEY (session_date, symbol, pattern_name, zone_anchor)
     );
 
     -- Insert default wallet if not exists
@@ -177,6 +255,33 @@ function initSchema() {
   addColumn('ai_decisions', 'reference_stop', 'REAL');
   addColumn('ai_decisions', 'evaluated_at', 'TEXT');
   addColumn('ai_decisions', 'opportunity_result', 'TEXT');
+  addColumn('ai_decisions', 'pattern_name', 'TEXT');
+  addColumn('ai_decisions', 'pattern_zone_anchor', 'REAL');
+  addColumn('ai_decisions', 'pattern_zone_tolerance', 'REAL');
+  addColumn('ai_decisions', 'pattern_target1', 'REAL');
+  addColumn('ai_decisions', 'pattern_target2', 'REAL');
+  addColumn('ai_decisions', 'pattern_stop', 'REAL');
+  addColumn('ai_live_orders', 'target1', 'REAL');
+  addColumn('ai_live_orders', 'target1_order_id', 'TEXT');
+  addColumn('ai_live_orders', 'target1_status', 'TEXT');
+  addColumn('ai_live_orders', 'target1_filled_quantity', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn('ai_live_orders', 'target1_exit_price', 'REAL');
+  addColumn('ai_live_orders', 'target1_done', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn('ai_live_orders', 'stop_order_id', 'TEXT');
+  addColumn('ai_live_orders', 'stop_status', 'TEXT');
+  addColumn('ai_live_orders', 'stop_remarks', 'TEXT');
+  addColumn('ai_live_orders', 'pattern_name', 'TEXT');
+  addColumn('ai_live_orders', 'pattern_zone_anchor', 'REAL');
+  addColumn('ai_live_orders', 'pattern_zone_tolerance', 'REAL');
+  addColumn('ai_live_orders', 'exit_reason', 'TEXT');
+  addColumn('ai_live_orders', 'atr_value', 'REAL');
+  addColumn('ai_live_orders', 'highest_price', 'REAL');
+  addColumn('ai_live_orders', 'lowest_price', 'REAL');
+  addColumn('positions', 'target1', 'REAL');
+  addColumn('positions', 'target1_hit', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn('positions', 'atr_value', 'REAL');
+  addColumn('positions', 'highest_price', 'REAL');
+  addColumn('positions', 'lowest_price', 'REAL');
   addColumn('ai_settings', 'ai_provider', `TEXT NOT NULL DEFAULT 'gemini'`);
   addColumn('ai_settings', 'openai_api_key', `TEXT NOT NULL DEFAULT ''`);
   addColumn('ai_settings', 'openai_model', `TEXT NOT NULL DEFAULT 'gpt-4o-mini'`);
@@ -188,6 +293,7 @@ function initSchema() {
   addColumn('ai_settings', 'trading_instructions', `TEXT NOT NULL DEFAULT ''`);
   addColumn('ai_settings', 'trading_skills', `TEXT NOT NULL DEFAULT '[]'`);
   addColumn('ai_settings', 'trading_skill_ids', `TEXT NOT NULL DEFAULT '["technical-analysis","risk-reward-ratio"]'`);
+  addColumn('ai_settings', 'auto_trade_universe', `TEXT NOT NULL DEFAULT 'watchlist'`);
   addColumn('positions', 'stop_loss', 'REAL');
   addColumn('positions', 'target', 'REAL');
   addColumn('positions', 'decision_id', 'INTEGER');

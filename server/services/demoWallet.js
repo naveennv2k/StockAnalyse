@@ -61,7 +61,7 @@ export class DemoWallet {
   }
 
   // ── Place Order (Demo) ──
-  placeOrder({ symbol, exchange = 'NSE', side, quantity, price, orderType = 'MARKET', productType = 'MIS', remarks = '', agentVerdict = '', agentConfidence = 0, allowShort = false, stopLoss = null, target = null, decisionId = null }) {
+  placeOrder({ symbol, exchange = 'NSE', side, quantity, price, orderType = 'MARKET', productType = 'MIS', remarks = '', agentVerdict = '', agentConfidence = 0, allowShort = false, stopLoss = null, target = null, target1 = null, atrValue = null, decisionId = null }) {
     const wallet = this.getWallet();
 
     if (!symbol || !side || !quantity || quantity <= 0) {
@@ -79,8 +79,11 @@ export class DemoWallet {
     ).get(symbol, exchange, productType);
     const curQty = position?.quantity || 0;
 
-    if (side === 'BUY' && totalCost + charges.total > wallet.cash_balance) {
-      return { success: false, error: `Insufficient funds. Need ₹${(totalCost + charges.total).toFixed(2)} including estimated charges, have ₹${wallet.cash_balance.toFixed(2)}` };
+    const shortCoverQuantity = side === 'BUY' && curQty < 0 ? Math.min(quantity, Math.abs(curQty)) : 0;
+    const newLongQuantity = side === 'BUY' ? quantity - shortCoverQuantity : 0;
+    const requiredCash = price * newLongQuantity + charges.total;
+    if (side === 'BUY' && newLongQuantity > 0 && requiredCash > wallet.cash_balance) {
+      return { success: false, error: `Insufficient funds to open ${newLongQuantity} additional long shares. Need ₹${requiredCash.toFixed(2)} including estimated charges, have ₹${wallet.cash_balance.toFixed(2)}` };
     }
     if (side === 'SELL' && curQty < quantity && !allowShort) {
       return { success: false, error: `Insufficient quantity. Have ${Math.max(curQty, 0)}, trying to sell ${quantity}` };
@@ -120,8 +123,8 @@ export class DemoWallet {
         this.db.prepare('DELETE FROM positions WHERE id = ?').run(position.id);
       } else if (!position) {
         this.db.prepare(
-          `INSERT INTO positions (symbol, exchange, quantity, avg_price, current_price, product_type, trading_mode, stop_loss, target, decision_id, open_charges) VALUES (?, ?, ?, ?, ?, ?, 'demo', ?, ?, ?, ?)`
-        ).run(symbol, exchange, newQty, fillPrice, fillPrice, productType, stopLoss, target, decisionId, openCharges);
+          `INSERT INTO positions (symbol, exchange, quantity, avg_price, current_price, product_type, trading_mode, stop_loss, target, target1, target1_hit, atr_value, highest_price, lowest_price, decision_id, open_charges) VALUES (?, ?, ?, ?, ?, ?, 'demo', ?, ?, ?, 0, ?, ?, ?, ?, ?)`
+        ).run(symbol, exchange, newQty, fillPrice, fillPrice, productType, stopLoss, target, target1, atrValue, fillPrice, fillPrice, decisionId, openCharges);
       } else {
         const sameDirection = Math.sign(curQty) === Math.sign(signedQty);
         const flipped = !sameDirection && Math.sign(newQty) !== Math.sign(curQty);
@@ -129,10 +132,15 @@ export class DemoWallet {
         if (sameDirection) avg = (position.avg_price * Math.abs(curQty) + fillPrice * quantity) / Math.abs(newQty);
         else if (flipped) avg = fillPrice;
         this.db.prepare(
-          `UPDATE positions SET quantity = ?, avg_price = ?, current_price = ?, pnl = (? - ?) * ? - ?, open_charges = ?, stop_loss = ?, target = ?, decision_id = ?, updated_at = datetime('now') WHERE id = ?`
+          `UPDATE positions SET quantity = ?, avg_price = ?, current_price = ?, pnl = (? - ?) * ? - ?, open_charges = ?, stop_loss = ?, target = ?, target1 = ?, target1_hit = ?, atr_value = ?, highest_price = ?, lowest_price = ?, decision_id = ?, updated_at = datetime('now') WHERE id = ?`
         ).run(newQty, Math.round(avg * 100) / 100, fillPrice, fillPrice, avg, newQty, openCharges, openCharges,
           !flipped && stopLoss == null ? position.stop_loss : stopLoss,
           !flipped && target == null ? position.target : target,
+          !flipped && target1 == null ? position.target1 : target1,
+          !flipped && target1 == null ? position.target1_hit : 0,
+          !flipped && atrValue == null ? position.atr_value : atrValue,
+          flipped ? fillPrice : Math.max(Number(position.highest_price) || position.current_price, fillPrice),
+          flipped ? fillPrice : Math.min(Number(position.lowest_price) || position.current_price, fillPrice),
           !flipped && decisionId == null ? position.decision_id : decisionId,
           position.id);
       }
@@ -155,11 +163,14 @@ export class DemoWallet {
 
   updatePositionPrices(priceMap) {
     const update = this.db.prepare(
-      `UPDATE positions SET current_price = ?, pnl = (? - avg_price) * quantity - open_charges, updated_at = datetime('now') WHERE symbol = ? AND trading_mode = 'demo'`
+      `UPDATE positions SET current_price = ?, pnl = (? - avg_price) * quantity - open_charges,
+        highest_price = CASE WHEN highest_price IS NULL OR ? > highest_price THEN ? ELSE highest_price END,
+        lowest_price = CASE WHEN lowest_price IS NULL OR ? < lowest_price THEN ? ELSE lowest_price END,
+        updated_at = datetime('now') WHERE symbol = ? AND trading_mode = 'demo'`
     );
     const updateMany = this.db.transaction((prices) => {
       for (const [symbol, price] of Object.entries(prices)) {
-        update.run(price, price, symbol);
+        update.run(price, price, price, price, price, price, symbol);
       }
     });
     updateMany(priceMap);
@@ -223,8 +234,12 @@ export class DemoWallet {
     `).run(tradeId, symbol, lessonType, whatHappened, whyItFailed, ruleLearned, severity);
   }
 
-  getLessons(limit = 20) {
-    return this.db.prepare('SELECT * FROM lessons ORDER BY created_at DESC LIMIT ?').all(limit);
+  getLessons(limit = 20, offset = 0) {
+    return this.db.prepare('SELECT * FROM lessons ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?').all(limit, offset);
+  }
+
+  getLessonCount() {
+    return this.db.prepare('SELECT COUNT(*) AS count FROM lessons').get().count;
   }
 
   // ── Agent Logs ──

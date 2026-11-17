@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { getDashboard, getQuotes, addToWatchlist, removeFromWatchlist, analyzeStocks, placeOrder } from '../services/api';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { getDashboard, getQuotes, addToWatchlist, removeFromWatchlist, analyzeStocks, placeOrder, searchSymbols } from '../services/api';
 import { useLiveTicks } from '../hooks/useLiveTicks';
 import { TrendingUp, TrendingDown, RefreshCw, Plus, X, Brain, IndianRupee, BarChart3, Target } from 'lucide-react';
 
@@ -12,9 +12,15 @@ export default function Dashboard() {
   const [ftError, setFtError] = useState(null);
   const [analysis, setAnalysis] = useState(null);
   const [newSymbol, setNewSymbol] = useState('');
+  const [symbolSuggestions, setSymbolSuggestions] = useState([]);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  const [activeSuggestion, setActiveSuggestion] = useState(0);
+  const [searchingSymbols, setSearchingSymbols] = useState(false);
   const [loading, setLoading] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState(null);
+  const orderInFlight = useRef(false);
+  const searchRequest = useRef(0);
   const { ticks } = useLiveTicks((dashboard?.watchlist || []).map((w) => w.symbol));
 
   const fetchData = useCallback(async () => {
@@ -42,11 +48,48 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  const handleAddSymbol = async () => {
-    if (!newSymbol.trim()) return;
-    await addToWatchlist(newSymbol.trim().toUpperCase());
+  useEffect(() => {
+    const query = newSymbol.trim();
+    const requestId = ++searchRequest.current;
+    if (query.length < 2) {
+      setSymbolSuggestions([]);
+      setSuggestionsOpen(false);
+      setSearchingSymbols(false);
+      return undefined;
+    }
+
+    const timer = setTimeout(async () => {
+      setSearchingSymbols(true);
+      try {
+        const result = await searchSymbols(query);
+        if (requestId !== searchRequest.current) return;
+        const watched = new Set((dashboard?.watchlist || []).map((item) => item.symbol));
+        setSymbolSuggestions((result.results || []).filter((item) => !watched.has(item.symbol)));
+        setActiveSuggestion(0);
+        setSuggestionsOpen(true);
+      } catch {
+        if (requestId === searchRequest.current) setSymbolSuggestions([]);
+      } finally {
+        if (requestId === searchRequest.current) setSearchingSymbols(false);
+      }
+    }, 180);
+
+    return () => clearTimeout(timer);
+  }, [newSymbol, dashboard?.watchlist]);
+
+  const handleAddSymbol = async (value = newSymbol) => {
+    if (!value.trim()) return;
+    await addToWatchlist(value.trim().toUpperCase());
     setNewSymbol('');
+    setSymbolSuggestions([]);
+    setSuggestionsOpen(false);
     fetchData();
+  };
+
+  const selectSuggestion = (symbol) => {
+    setNewSymbol(symbol);
+    setSymbolSuggestions([]);
+    setSuggestionsOpen(false);
   };
 
   const handleRemoveSymbol = async (symbol) => {
@@ -68,19 +111,32 @@ export default function Dashboard() {
     }
   };
 
-  const handleQuickOrder = async (symbol, side, price) => {
+  const handleQuickOrder = async (symbol, side, price, exchange = 'NSE') => {
+    if (orderInFlight.current) return;
     const qty = prompt(`${side} ${symbol}\nEnter quantity:`, '1');
-    if (!qty) return;
+    if (qty == null) return;
+    const quantity = Number(qty);
+    if (!Number.isSafeInteger(quantity) || quantity < 1) {
+      alert('Quantity must be a positive whole number.');
+      return;
+    }
+    const live = dashboard?.wallet?.trading_mode === 'live';
+    if (live && !window.confirm(`LIVE ORDER: Submit a MARKET ${side} order for ${quantity} ${symbol} on ${exchange} as MIS?\n\nThis sends a real order to Flattrade and may execute immediately. The displayed price is only a reference, not a guaranteed fill price.`)) return;
+    orderInFlight.current = true;
     try {
-      const res = await placeOrder({ symbol, side, quantity: parseInt(qty), price, orderType: 'MARKET', productType: 'MIS' });
+      const res = await placeOrder({ symbol, side, quantity, price, exchange, orderType: 'MARKET', productType: 'MIS', ...(live ? { liveConfirmed: true } : {}) });
       if (res.success) {
-        alert(`✅ ${side} order placed: ${qty}x ${symbol} @ ₹${price}`);
+        alert(live
+          ? `Flattrade accepted order ${res.order_number}: ${side} ${quantity} ${res.symbol}. Check the broker order book for fill status.`
+          : `${side} order placed: ${quantity}x ${symbol} @ ₹${price}`);
         fetchData();
       } else {
         alert(`❌ ${res.error}`);
       }
     } catch (err) {
       alert(`❌ ${err.message}`);
+    } finally {
+      orderInFlight.current = false;
     }
   };
 
@@ -96,7 +152,7 @@ export default function Dashboard() {
       {/* Stats Cards */}
       {wallet.trading_mode === 'live' ? (
         <div>
-          <p className="text-xs font-semibold text-red-600 mb-2">LIVE MODE — real Flattrade account (read-only)</p>
+          <p className="text-xs font-semibold text-red-600 mb-2">LIVE MODE — manual Flattrade market orders require confirmation. AI auto-trading remains disabled in live mode.</p>
           {dashboard.live_account?.account ? (
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
               <StatCard icon={BarChart3} label="Cash Balance" value={`₹${fmt(dashboard.live_account.account.cash)}`} color="green" />
@@ -125,12 +181,52 @@ export default function Dashboard() {
         <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
           <h2 className="font-semibold text-slate-800">📊 Watchlist</h2>
           <div className="flex items-center gap-2">
-            <input
-              type="text" value={newSymbol} onChange={e => setNewSymbol(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && handleAddSymbol()}
-              placeholder="Add symbol..." className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm w-36"
-            />
-            <button onClick={handleAddSymbol} className="bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-3 py-1.5 text-sm flex items-center gap-1">
+            <div className="relative">
+              <input
+                type="text" value={newSymbol} role="combobox" aria-autocomplete="list"
+                aria-expanded={suggestionsOpen && symbolSuggestions.length > 0}
+                aria-controls="watchlist-symbol-suggestions"
+                onFocus={() => symbolSuggestions.length && setSuggestionsOpen(true)}
+                onChange={(e) => { setNewSymbol(e.target.value); setSuggestionsOpen(true); }}
+                onKeyDown={(e) => {
+                  if (e.key === 'ArrowDown' && symbolSuggestions.length) {
+                    e.preventDefault();
+                    setSuggestionsOpen(true);
+                    setActiveSuggestion((index) => (index + 1) % symbolSuggestions.length);
+                  } else if (e.key === 'ArrowUp' && symbolSuggestions.length) {
+                    e.preventDefault();
+                    setActiveSuggestion((index) => (index - 1 + symbolSuggestions.length) % symbolSuggestions.length);
+                  } else if (e.key === 'Escape') {
+                    setSuggestionsOpen(false);
+                  } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (suggestionsOpen && symbolSuggestions[activeSuggestion]) selectSuggestion(symbolSuggestions[activeSuggestion].symbol);
+                    else handleAddSymbol();
+                  }
+                }}
+                placeholder="Search stocks..." className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm w-44"
+              />
+              {suggestionsOpen && newSymbol.trim().length >= 2 && (
+                <div id="watchlist-symbol-suggestions" role="listbox" className="absolute z-20 top-full mt-1 left-0 w-72 max-h-72 overflow-y-auto rounded-lg border border-slate-200 bg-white shadow-lg">
+                  {searchingSymbols && <div className="px-3 py-2 text-xs text-slate-400">Searching...</div>}
+                  {!searchingSymbols && symbolSuggestions.length === 0 && <div className="px-3 py-2 text-xs text-slate-400">No matching stocks</div>}
+                  {symbolSuggestions.map((item, index) => (
+                    <button key={`${item.symbol}-${item.series}`} type="button" role="option" aria-selected={index === activeSuggestion}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onMouseEnter={() => setActiveSuggestion(index)}
+                      onClick={() => selectSuggestion(item.symbol)}
+                      className={`flex w-full items-center justify-between gap-3 px-3 py-2 text-left ${index === activeSuggestion ? 'bg-blue-50' : 'hover:bg-slate-50'}`}>
+                      <span className="min-w-0">
+                        <span className="block text-sm font-medium text-slate-800">{item.symbol}</span>
+                        <span className="block truncate text-xs text-slate-500">{item.name}</span>
+                      </span>
+                      <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">{item.series}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <button onClick={() => handleAddSymbol()} className="bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-3 py-1.5 text-sm flex items-center gap-1">
               <Plus size={14} /> Add
             </button>
             <button onClick={fetchData} className="text-slate-400 hover:text-slate-600 p-1.5"><RefreshCw size={16} /></button>
@@ -186,9 +282,9 @@ export default function Dashboard() {
                     <td className="px-4 py-2.5 text-right font-mono text-slate-400">{fmtInt(q.volume)}</td>
                     <td className="px-4 py-2.5 text-center">
                       <div className="flex gap-1 justify-center">
-                        <button onClick={() => handleQuickOrder(q.symbol?.replace('-EQ',''), 'BUY', q.ltp)}
+                        <button onClick={() => handleQuickOrder(q.symbol?.replace('-EQ',''), 'BUY', q.ltp, q.exchange || 'NSE')}
                           className="bg-green-100 hover:bg-green-200 text-green-700 text-xs font-bold px-2 py-1 rounded">B</button>
-                        <button onClick={() => handleQuickOrder(q.symbol?.replace('-EQ',''), 'SELL', q.ltp)}
+                        <button onClick={() => handleQuickOrder(q.symbol?.replace('-EQ',''), 'SELL', q.ltp, q.exchange || 'NSE')}
                           className="bg-red-100 hover:bg-red-200 text-red-700 text-xs font-bold px-2 py-1 rounded">S</button>
                       </div>
                     </td>

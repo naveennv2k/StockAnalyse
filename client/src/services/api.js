@@ -20,6 +20,7 @@ export const getCandles = (symbol, interval = '5m') => request(`/candles?symbol=
 export const getNews = (symbol) => request(`/news?symbol=${encodeURIComponent(symbol)}`);
 export const scanMarket = (interval = '5m', minConfidence = 60, universe = 'nifty50') => request(`/scan?interval=${interval}&min_confidence=${minConfidence}&universe=${universe}`);
 export const getFlattradeStatus = () => request('/flattrade/status');
+export const getFlattradeOrders = () => request('/flattrade/orders');
 export const startFlattradeAuth = () => request('/flattrade/auth/start', { method: 'POST' });
 export const searchSymbols = (q) => request(`/symbols/search?q=${encodeURIComponent(q)}`);
 export const getHistorical = (symbol, period = '1mo', interval = '1d') => request(`/historical?symbol=${symbol}&period=${period}&interval=${interval}`);
@@ -45,7 +46,7 @@ export const setTradingMode = (mode) => request('/trading-mode', { method: 'POST
 
 // Agents
 export const getAgentLogs = (limit = 50) => request(`/agent/logs?limit=${limit}`);
-export const getLessons = () => request('/agent/lessons');
+export const getLessons = (limit = 20, offset = 0) => request(`/agent/lessons?limit=${limit}&offset=${offset}`);
 
 // Gemini AI + auto-trader
 export const getAiSettings = () => request('/ai/settings');
@@ -53,5 +54,6 @@ export const getAvailableAiSkills = () => request('/ai/skills');
 export const saveAiSettings = (settings) => request('/ai/settings', { method: 'POST', body: JSON.stringify(settings) });
 export const testAi = (provider) => request('/ai/test', { method: 'POST', body: JSON.stringify({ provider }) });
 export const getAutoTradeStatus = () => request('/autotrade/status');
-export const toggleAutoTrade = (enabled) => request('/autotrade/toggle', { method: 'POST', body: JSON.stringify({ enabled }) });
+export const runCalibrationBacktest = () => request('/autotrade/calibration/backtest', { method: 'POST' });
+export const toggleAutoTrade = (enabled, options = {}) => request('/autotrade/toggle', { method: 'POST', body: JSON.stringify({ enabled, ...options }) });
 export const runAutoTradeNow = () => request('/autotrade/run', { method: 'POST' });

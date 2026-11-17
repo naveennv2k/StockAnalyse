@@ -41,7 +41,7 @@ export class MarketDataService {
   /**
    * Analyze stocks using the Stock Monitor Agent
    */
-  async analyzeStocks(symbols, interval = '5m', exchange = 'NSE') {
+  async analyzeStocks(symbols, interval = '5m', exchange = 'NSE', strictFlattrade = false) {
     const cleanSymbols = [...new Set((symbols || []).map((s) => String(s).trim().toUpperCase()))];
     if (!cleanSymbols.length || cleanSymbols.some((s) => !/^[A-Z0-9&_-]{1,20}$/.test(s))) return [];
     if (!['NSE', 'BSE'].includes(exchange)) return [];
@@ -49,8 +49,10 @@ export class MarketDataService {
     const script = `
 import json, sys, math
 sys.path.insert(0, '${PYTHON_API_DIR}')
+from stock_data_provider import StockDataProvider, DataSource
 from stock_monitor_agent import StockMonitorAgent
-agent = StockMonitorAgent()
+provider = StockDataProvider(source=DataSource.FLATTRADE if ${strictFlattrade ? 'True' : 'False'} else DataSource.AUTO)
+agent = StockMonitorAgent(provider=provider)
 results = agent.analyze_watchlist(${JSON.stringify(cleanSymbols)}, interval='${interval}', exchange='${exchange}')
 for r in results:
     r['exchange'] = '${exchange}'
@@ -111,12 +113,14 @@ else:
   /**
    * OHLCV candles with epoch-second timestamps (supports intraday)
    */
-  async getCandles(symbol, interval = '5m') {
+  async getCandles(symbol, interval = '5m', exchange = 'NSE', strictFlattrade = false) {
     const periods = { '1m': '1d', '5m': '5d', '15m': '5d', '30m': '1mo', '1h': '1mo', '1d': '6mo' };
     if (!periods[interval]) throw new Error('Invalid interval');
     if (!/^[A-Za-z0-9&_-]{1,20}$/.test(symbol)) throw new Error('Invalid symbol');
+    if (!['NSE', 'BSE'].includes(exchange)) throw new Error('Invalid exchange');
 
-    const cacheKey = `candles:${symbol}:${interval}`;
+    const sourceMode = strictFlattrade ? 'flattrade' : 'auto';
+    const cacheKey = `candles:${exchange}:${symbol}:${interval}:${sourceMode}`;
     const cached = this._getFromCache(cacheKey);
     if (cached) return cached;
 
@@ -124,8 +128,8 @@ else:
 import json, sys, math
 sys.path.insert(0, '${PYTHON_API_DIR}')
 from stock_data_provider import StockDataProvider, DataSource
-provider = StockDataProvider(source=DataSource.AUTO)
-df = provider.get_historical('${symbol}', period='${periods[interval]}', interval='${interval}')
+provider = StockDataProvider(source=DataSource.FLATTRADE if ${strictFlattrade ? 'True' : 'False'} else DataSource.AUTO)
+df = provider.get_historical('${symbol}', period='${periods[interval]}', interval='${interval}', exchange='${exchange}')
 out = []
 source = 'unknown'
 if not df.empty:
@@ -151,7 +155,7 @@ print(json.dumps({'data': out, 'source': source}))
   /**
    * Scan the intraday universe; results cached 3 min and concurrent calls share one run
    */
-  scanMarket(interval = '5m', minConfidence = 60, universe = 'nifty50') {
+  scanMarket(interval = '5m', minConfidence = 60, universe = 'nifty50', strictFlattrade = false) {
     if (!['1m', '5m', '15m', '30m', '1h'].includes(interval)) return Promise.reject(new Error('Invalid interval'));
     // Cache lifetime (minutes) grows with universe size since a scan takes longer.
     const ttlMin = { nifty50: 3, nifty100: 5, nifty200: 8, nifty500: 15 }[universe];
@@ -162,7 +166,8 @@ print(json.dumps({'data': out, 'source': source}))
     this.scans ??= new Map();
     // One scan serves every threshold >= 40; the requested threshold is applied on the way out.
     const runFloor = Math.min(conf, 40);
-    const key = `${universe}:${interval}:${runFloor}`;
+    const source = strictFlattrade ? 'flattrade' : 'auto';
+    const key = `${universe}:${interval}:${source}:${runFloor}`;
     const withThreshold = (p) => p.then((d) => ({
       ...d,
       min_confidence: conf,
@@ -175,7 +180,7 @@ print(json.dumps({'data': out, 'source': source}))
     }
 
     const promise = new Promise((resolve, reject) => {
-      execFile('python3', ['scan_market.py', interval, String(runFloor), universe], {
+      execFile('python3', ['scan_market.py', interval, String(runFloor), universe, source], {
         timeout: 20 * 60000,
         maxBuffer: 50 * 1024 * 1024,
         cwd: PYTHON_API_DIR,
@@ -197,6 +202,40 @@ print(json.dumps({'data': out, 'source': source}))
     );
     this.scans.set(key, { promise });
     return withThreshold(promise);
+  }
+
+  backtestWatchlist(symbols, candidateMinConfidence = 50, capital = 1000000, positionPct = 10) {
+    const watchlist = [...new Map((symbols || []).map((item) => {
+      const symbol = String(item?.symbol || '').trim().toUpperCase();
+      const exchange = String(item?.exchange || 'NSE').trim().toUpperCase();
+      if (!/^[A-Z0-9&_-]{1,20}$/.test(symbol) || !['NSE', 'BSE'].includes(exchange)) return null;
+      return [`${exchange}:${symbol}`, { symbol, exchange }];
+    }).filter(Boolean)).values()];
+    if (!watchlist.length || watchlist.length > 100) return Promise.reject(new Error('Watchlist must contain 1 to 100 valid NSE/BSE symbols'));
+    if (!Number.isInteger(Number(candidateMinConfidence)) || candidateMinConfidence < 0 || candidateMinConfidence > 100) {
+      return Promise.reject(new Error('Invalid scanner confidence threshold'));
+    }
+    if (!Number.isFinite(Number(capital)) || capital <= 0 || !Number.isFinite(Number(positionPct)) || positionPct <= 0 || positionPct > 25) {
+      return Promise.reject(new Error('Invalid backtest capital or position size'));
+    }
+    return new Promise((resolve, reject) => {
+      execFile('python3', [
+        'backtest_watchlist.py', JSON.stringify(watchlist), String(candidateMinConfidence), String(capital), String(positionPct),
+      ], {
+        timeout: 30 * 60 * 1000,
+        maxBuffer: 10 * 1024 * 1024,
+        cwd: PYTHON_API_DIR,
+      }, (error, stdout, stderr) => {
+        if (error) return reject(new Error(stderr || error.message));
+        try {
+          const result = JSON.parse(stdout.trim().split('\n').pop());
+          if (result.error) return reject(new Error(result.error));
+          resolve(result);
+        } catch {
+          reject(new Error('Calibration replay returned invalid output'));
+        }
+      });
+    });
   }
 
   // ── Internal helpers ──

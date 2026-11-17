@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { getAgentLogs, getLessons, analyzeStocks, getWatchlist, getAutoTradeStatus, toggleAutoTrade, runAutoTradeNow, getAiSettings, getAvailableAiSkills, saveAiSettings } from '../services/api';
+import { getAgentLogs, getLessons, analyzeStocks, getWatchlist, getAutoTradeStatus, toggleAutoTrade, runAutoTradeNow, runCalibrationBacktest, getAiSettings, getAvailableAiSkills, saveAiSettings } from '../services/api';
 import { Bot, Brain, BookOpen, AlertTriangle, CheckCircle, XCircle, Play, RefreshCw } from 'lucide-react';
 
 const AGENTS = [
@@ -21,21 +21,44 @@ const formatIstTimestamp = (value) => {
 export default function AgentMonitor() {
   const [logs, setLogs] = useState([]);
   const [lessons, setLessons] = useState([]);
+  const [lessonTotal, setLessonTotal] = useState(0);
+  const [lessonsLoading, setLessonsLoading] = useState(false);
+  const lessonOffset = useRef(0);
   const [pipelineStatus, setPipelineStatus] = useState('idle'); // idle, running, done
   const [pipelineResults, setPipelineResults] = useState(null);
   const [loading, setLoading] = useState(true);
 
   const fetchData = useCallback(async () => {
     try {
-      const [logRes, lessonRes] = await Promise.all([getAgentLogs(), getLessons()]);
+      const [logRes, lessonRes] = await Promise.all([getAgentLogs(), getLessons(20, 0)]);
       setLogs(logRes.logs || []);
-      setLessons(lessonRes.lessons || []);
+      setLessonTotal(lessonRes.total ?? lessonRes.lessons?.length ?? 0);
+      if (lessonOffset.current === 0) {
+        setLessons(lessonRes.lessons || []);
+        lessonOffset.current = lessonRes.lessons?.length || 0;
+      }
     } catch (err) {
       console.error(err);
     } finally {
       setLoading(false);
     }
   }, []);
+
+  const loadMoreLessons = async () => {
+    if (lessonsLoading || lessonOffset.current >= lessonTotal) return;
+    setLessonsLoading(true);
+    try {
+      const result = await getLessons(20, lessonOffset.current);
+      const page = result.lessons || [];
+      setLessons((current) => [...current, ...page]);
+      lessonOffset.current += page.length;
+      setLessonTotal(result.total ?? lessonTotal);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLessonsLoading(false);
+    }
+  };
 
   useEffect(() => {
     fetchData();
@@ -150,7 +173,7 @@ export default function AgentMonitor() {
       {/* Lessons from Correction Agent */}
       <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
         <h3 className="font-semibold text-slate-800 mb-3 flex items-center gap-2">
-          <BookOpen size={18} className="text-orange-600" /> Learned Lessons ({lessons.length})
+          <BookOpen size={18} className="text-orange-600" /> Learned Lessons ({lessons.length}{lessonTotal > lessons.length ? ` of ${lessonTotal}` : ''})
         </h3>
         {lessons.length === 0 ? (
           <p className="text-sm text-slate-400 text-center py-6">
@@ -172,6 +195,12 @@ export default function AgentMonitor() {
                 <p className="text-xs text-slate-500 mt-0.5">📝 Rule: <span className="font-medium">{l.rule_learned}</span></p>
               </div>
             ))}
+            {lessons.length < lessonTotal && (
+              <button disabled={lessonsLoading} onClick={loadMoreLessons}
+                className="w-full border border-slate-200 rounded-lg py-2 text-sm text-slate-600 hover:bg-slate-50 disabled:opacity-50">
+                {lessonsLoading ? 'Loading lessons...' : `Load 20 more (${lessonTotal - lessons.length} remaining)`}
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -214,6 +243,8 @@ function AutoTraderPanel({ onChange }) {
   const [status, setStatus] = useState(null);
   const [settings, setSettings] = useState(null);
   const [risk, setRisk] = useState({});
+  const [universe, setUniverse] = useState('watchlist');
+  const universeDirty = useRef(false);
   const [instructions, setInstructions] = useState('');
   const instructionsDirty = useRef(false);
   const [skills, setSkills] = useState([]);
@@ -223,6 +254,9 @@ function AutoTraderPanel({ onChange }) {
   const repoSkillsDirty = useRef(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null);
+  const [backtestBusy, setBacktestBusy] = useState(false);
+  const [backtestReport, setBacktestReport] = useState(null);
+  const [backtestError, setBacktestError] = useState(null);
 
   const load = useCallback(async () => {
     try {
@@ -231,6 +265,7 @@ function AutoTraderPanel({ onChange }) {
       setSettings(se);
       setRepoSkillCatalog(catalog.skills || []);
       setRisk((r) => (Object.keys(r).length ? r : Object.fromEntries(RISK_FIELDS.map((f) => [f.key, se[f.key]]))));
+      if (!universeDirty.current) setUniverse(se.auto_trade_universe || 'watchlist');
       if (!instructionsDirty.current) setInstructions(se.trading_instructions || '');
       if (!skillsDirty.current) setSkills(se.trading_skills || []);
       if (!repoSkillsDirty.current) setRepoSkillIds(se.trading_skill_ids || []);
@@ -260,42 +295,66 @@ function AutoTraderPanel({ onChange }) {
     }
   };
 
+  const runHistoricalBacktest = async () => {
+    if (backtestBusy) return;
+    setBacktestBusy(true);
+    setBacktestError(null);
+    try {
+      setBacktestReport(await runCalibrationBacktest());
+    } catch (error) {
+      setBacktestError(error.message);
+    } finally {
+      setBacktestBusy(false);
+    }
+  };
+
   if (!status || !settings) return null;
   const s = status.stats;
+  const liveMode = status.trading_mode === 'live';
 
   return (
     <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
       <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
         <div>
-          <h2 className="font-semibold text-slate-800 text-lg flex items-center gap-2"><Bot size={22} className="text-green-600" /> Auto Trader (demo wallet)</h2>
+          <h2 className="font-semibold text-slate-800 text-lg flex items-center gap-2"><Bot size={22} className={liveMode ? 'text-red-600' : 'text-green-600'} /> Auto Trader ({liveMode ? 'Flattrade live account' : 'demo wallet'})</h2>
           <p className="text-xs text-slate-500 mt-0.5">
-            Watchlist picks → the AI ({(settings.ai_chain || []).map((p) => ({ gemini: 'Gemini', openai: 'ChatGPT', vscode: 'Copilot', ollama: 'Ollama' }[p])).join(' \u2192 ')}) decides using indicators, news and past lessons → demo order with stop-loss, target and 3:15 PM square-off.
+            Watchlist picks → the AI ({(settings.ai_chain || []).map((p) => ({ gemini: 'Gemini', openai: 'ChatGPT', vscode: 'Copilot', ollama: 'Ollama' }[p])).join(' \u2192 ')}) decides using indicators, news and past lessons → {liveMode ? 'Flattrade market order' : 'demo order'} with stop-loss, target and 3:10 PM square-off.
             Market is {status.market_open ? 'open' : 'closed'}.
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button disabled={busy || !settings.ai_enabled} onClick={() => act(runAutoTradeNow, (r) => `Run finished: ${r.opened.length} opened, ${r.closed.length} closed, ${r.skipped.length} skipped${r.errors.length ? `, errors: ${r.errors.join('; ')}` : ''}`)}
+          <button disabled={busy || !settings.ai_enabled || (liveMode && !status.live_armed)} onClick={() => {
+            if (liveMode && !window.confirm('Run one AI cycle using REAL Flattrade orders? Review the watchlist and risk limits first.')) return;
+            act(runAutoTradeNow, (r) => `Run finished: ${r.opened.length} opened, ${r.closed.length} closed, ${r.skipped.length} skipped${r.errors.length ? `, errors: ${r.errors.join('; ')}` : ''}`);
+          }}
             className="bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 rounded-lg px-4 py-2 text-sm font-medium flex items-center gap-1.5">
             <Play size={14} /> Run now
           </button>
-          <button disabled={busy} onClick={() => act(() => toggleAutoTrade(!status.enabled), (r) => (r.enabled ? 'Auto-trading on' : 'Auto-trading off'))}
+          <button disabled={busy} onClick={() => {
+            const enable = !status.enabled;
+            if (enable && liveMode && !window.confirm('ARM LIVE AI TRADING? The AI may submit real Flattrade market orders automatically during the entry window. Software-managed exits require this server to stay online.')) return;
+            act(() => toggleAutoTrade(enable, { liveConfirmed: liveMode && enable }), (r) => (r.enabled ? 'Auto-trading on' : 'Auto-trading off'));
+          }}
             className={`rounded-lg px-4 py-2 text-sm font-medium text-white disabled:opacity-50 ${status.enabled ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`}>
-            {status.enabled ? 'Stop auto-trading' : 'Start auto-trading'}
+            {status.enabled ? 'Stop auto-trading' : liveMode ? 'Arm live AI trading' : 'Start auto-trading'}
           </button>
         </div>
       </div>
 
       {!settings.ai_enabled && <p className="text-sm text-amber-600 mb-3">AI is not enabled. Add your Gemini or ChatGPT key on the Integrations page.</p>}
+      {status.daily_loss_locked && <p className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg p-3 mb-3">Daily 3% loss limit reached. New entries are locked until the next IST trading day; open positions are still monitored.</p>}
+      {liveMode && <p className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg p-3 mb-3">Live orders use Flattrade funds. A broker SL-M stop is placed after entry fill; Target 1/2 and square-off are managed by this app. Keep the server and feed running. A confirmed stop rejection falls back to software monitoring; an uncertain broker response pauses management for reconciliation.</p>}
       {msg && <p className={`text-sm mb-3 ${msg.ok ? 'text-green-600' : 'text-red-600'}`}>{msg.text}</p>}
 
       <div className="flex flex-wrap items-center gap-2 text-sm text-slate-600 mb-3">
         <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${status.enabled ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>{status.enabled ? 'ON' : 'OFF'}</span>
         <span>
-          {!status.enabled && 'Auto-trading is off.'}
+          {!status.enabled && status.managing_live_positions && 'New live entries are disarmed; existing AI positions remain monitored.'}
+          {!status.enabled && !status.managing_live_positions && 'Auto-trading is off.'}
           {status.enabled && status.running && 'Running a cycle...'}
-          {status.enabled && !status.running && !status.market_open && 'Waiting for market hours (Mon–Fri, 9:15–15:30 IST; new entries 9:15–14:45). Use "Run now" to test with the last session\'s prices.'}
-          {status.enabled && !status.running && status.market_open && !status.entry_window_open && 'Market is open, but the new-entry window has closed at 14:45 IST. Open positions are still monitored.'}
-          {status.enabled && !status.running && status.entry_window_open && `Entry window open — watchlist and AI opportunities checked every minute; position prices are checked ${status.live_feed?.connected ? 'from the Flattrade stream every second' : 'by fallback polling about every 15 seconds'}.`}
+          {status.enabled && !status.running && !status.market_open && 'Waiting for market hours (Mon–Fri, 9:15–15:30 IST; entries 9:30–11:15 and 13:45–15:00).'}
+          {status.enabled && !status.running && status.market_open && !status.entry_window_open && 'Outside entry windows (9:30–11:15 and 13:45–15:00 IST); open positions are still monitored.'}
+          {status.enabled && !status.running && status.entry_window_open && `Entry window open — watchlist and AI opportunities checked every 15 seconds; position prices are checked ${status.live_feed?.connected ? 'from the Flattrade stream every second' : 'by fallback polling about every 15 seconds'}.`}
         </span>
         {status.enabled && status.entry_window_open && (
           <span className={`text-xs ${status.live_feed?.connected ? 'text-green-600' : 'text-amber-600'}`} title={status.live_feed?.error || ''}>
@@ -324,6 +383,89 @@ function AutoTraderPanel({ onChange }) {
         ))}
       </div>
 
+      <div className="mb-4 border border-slate-200 rounded-lg p-3">
+        <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+          <h3 className="text-sm font-semibold text-slate-800">BUY / SELL shadow calibration</h3>
+          <span className="text-[11px] text-slate-400">Observe only · does not affect orders · stop / target / 15:10 IST square-off · 5 bps modeled slippage per side</span>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {(status.calibration?.sides || []).map((side) => (
+            <div key={side.side} className="bg-slate-50 rounded p-2.5">
+              <div className="flex justify-between text-xs font-medium text-slate-700">
+                <span>{side.side}</span>
+                <span>{side.samples} scored samples</span>
+              </div>
+              <div className="mt-1 text-[11px] text-slate-500">
+                Train {side.training_samples} · holdout {side.holdout_samples} · holdout wins {side.holdout_win_rate == null ? '-' : `${Math.round(side.holdout_win_rate * 100)}%`}
+              </div>
+              <div className="text-[11px] text-slate-500">
+                Raw Brier {side.raw_score_brier ?? '-'} · calibrated Brier {side.calibrated_brier ?? '-'}
+              </div>
+              {side.enough_samples && <div className="mt-1 text-[11px] text-emerald-700">Sample threshold reached; still shadow-only.</div>}
+            </div>
+          ))}
+        </div>
+        <p className="text-[11px] text-slate-400 mt-2">Scores are not probabilities until validated. The first 80% of samples form score buckets; the latest 20% are holdout. At least 200 training and 50 holdout samples per side are required before review.</p>
+      </div>
+
+      <div className="mb-4 border border-slate-200 rounded-lg p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-800">Historical watchlist replay</h3>
+            <p className="text-[11px] text-slate-400">Six months of Flattrade 5-minute data · technical scanner scores · no orders submitted</p>
+          </div>
+          <button disabled={backtestBusy} onClick={runHistoricalBacktest}
+            className="bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-700 rounded px-3 py-1.5 text-xs font-medium">
+            {backtestBusy ? 'Fetching history and replaying...' : 'Run historical replay'}
+          </button>
+        </div>
+        {backtestError && <p className="text-xs text-red-600 mt-2">{backtestError}</p>}
+        {backtestReport && (
+          <>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+              {Object.values(backtestReport.side_metrics || {}).map((side) => (
+                <div key={side.side} className="bg-slate-50 rounded p-2.5">
+                  <div className="flex justify-between text-xs font-medium text-slate-700">
+                    <span>{side.side}</span><span>{side.samples} counterfactual samples</span>
+                  </div>
+                  <div className="mt-1 text-[11px] text-slate-500">Holdout win rate {side.holdout_win_rate == null ? '-' : `${Math.round(side.holdout_win_rate * 100)}%`} · net P&amp;L ₹{side.holdout_net_pnl ?? '-'} · raw Brier {side.raw_score_brier ?? '-'} · calibrated Brier {side.calibrated_brier ?? '-'}</div>
+                  <div className="text-[11px] text-slate-500">Training {side.training_samples} · holdout {side.holdout_samples} · calibrated holdout {side.calibrated_holdout_samples}</div>
+                  {side.enough_samples && <div className="text-[11px] text-emerald-700">Sample threshold reached; result remains advisory.</div>}
+                </div>
+              ))}
+            </div>
+            <p className="text-[11px] text-slate-500 mt-2">Scanned {backtestReport.scanner_candidates} candidates across {backtestReport.coverage?.length || 0} symbols. This calibrates scanner-derived scores, not historical LLM scores; the holdout is the latest 20% by time.</p>
+            {backtestReport.coverage?.some((item) => item.error) && <p className="text-[11px] text-amber-700 mt-1">Some symbols returned incomplete history: {backtestReport.coverage.filter((item) => item.error).map((item) => item.symbol).join(', ')}.</p>}
+          </>
+        )}
+      </div>
+
+      <div className="mb-4 max-w-sm">
+        <label htmlFor="auto-trade-universe" className="text-xs font-medium text-slate-600 block mb-1">Stocks to scan</label>
+        <select
+          id="auto-trade-universe"
+          value={universe}
+          disabled={busy}
+          onChange={(e) => {
+            const selected = e.target.value;
+            universeDirty.current = true;
+            setUniverse(selected);
+            act(
+              () => saveAiSettings({ auto_trade_universe: selected }),
+              () => { universeDirty.current = false; return 'Auto-trade universe saved'; },
+            );
+          }}
+          className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white"
+        >
+          <option value="watchlist">My watchlist</option>
+          <option value="nifty50">Nifty 50</option>
+          <option value="nifty100">Nifty 100</option>
+          <option value="nifty200">Nifty 200</option>
+          <option value="nifty500">Nifty 500</option>
+        </select>
+        <p className="text-xs text-slate-400 mt-1">Selected: {universe === 'watchlist' ? 'My watchlist' : universe.toUpperCase()}</p>
+      </div>
+
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3 items-end mb-4">
         {RISK_FIELDS.map((f) => (
           <div key={f.key}>
@@ -346,7 +488,7 @@ function AutoTraderPanel({ onChange }) {
           className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm resize-y"
         />
         <div className="flex items-center justify-between mt-1">
-          <p className="text-xs text-slate-400">Advisory only. Cannot override demo-only execution, confidence limits, position limits, or 2% stop / 4% target.</p>
+          <p className="text-xs text-slate-400">Advisory only. Cannot override execution safeguards, confidence limits, position limits, or the 2% stop / 4% target.</p>
           <span className="text-xs text-slate-400">{instructions.length}/1500</span>
         </div>
       </div>
@@ -357,8 +499,9 @@ function AutoTraderPanel({ onChange }) {
             trading_instructions: instructions,
             trading_skills: skills,
             trading_skill_ids: repoSkillIds,
+            auto_trade_universe: universe,
           }),
-          () => { instructionsDirty.current = false; skillsDirty.current = false; repoSkillsDirty.current = false; return 'Risk limits, instructions, and skills saved'; },
+          () => { instructionsDirty.current = false; skillsDirty.current = false; repoSkillsDirty.current = false; universeDirty.current = false; return 'Risk limits, instructions, and skills saved'; },
         )}
           className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-lg px-4 py-1.5 text-sm font-medium">Save limits &amp; instructions</button>
       </div>
